@@ -15,23 +15,71 @@ else:
 
 class EM:
     '''
-    Class handling the EM algorithm latent variables, parameters and hyper_parameters.
+    Class handling the EM algorithm latent variables, parameters and hyper-parameters.
 
-    Initialize with EM(h).
+    Initialize with EM(h) where h is a numpy array containing the Room Impulse
+    Response (RIR).
 
-    The algorithm is then followed with the methods E_Step() and M_Step().
+    The algorithm is then followed with both the Expectation and Maximization
+    steps by the method iteration(). Alternatively, specific steps can be
+    computed using the methods E_Step(), M_g(), M_la(), M_a() and M_Step().
+
+
+    Parameters
+    ----------
+    h : ndarray of shape (n_samples,)
+        Real-valued time-series representation of the RIR.
+    P : int, default=20
+        Order of the auto-regressive filter g.
+    log : TextIOWrapper, default=sys.stdout
+        File object used to print any log, default to standart output.
+
+
+    Attributes
+    ----------
+    L_h : int
+        Length of the input RIR.
+    h : ndarray of shape (L_h,)
+        Real-valued time-series representation of the input RIR.
+    it : int
+        Number of past calls of the method iteration().
+    P : int
+        Order of the auto-regressive filter g.
+
+    mu : ndarray of shape (L_h,)
+        Estimated mean of the latent variable b.
+    R : ndarray of shape (L_h, L_h)
+        Estimated covariance of the latent variable b.
+
+    la : float
+        Estimated parameter lambda.
+    a : float
+        Estimated exponential decrease parameter a.
+    sigma2 : float
+        Estimated white noise parameter sigma^2.
+    A : ndarray of shape (P,)
+        AR coefficients of the estimated filter g.
+
+    la_list : list of float
+        List of past estimated parameter lambda.
+    a_list : list of float
+        List of past estimated exponential decrease parameter a.
+    sigma2_list : list of float
+        List of past estimated white noise parameter sigma^2.
+    A_list : list of ndarray of shape (P,)
+        List of past AR coefficients of the estimated filter g.
+    LP_list : list of float
+        List of past log-probabilities computed by the method iteration().
     '''
 
-    def __init__(self, h, log=sys.stdout):
+    def __init__(self, h, P=20, log=sys.stdout):
         self.logfile = log
         print("Initializing EM algorithm", file=self.logfile)
 
         ## Load hyper-parameters and observed variable
         self.h = np.array(h)
         self.L_h = len(h)
-
         self.d = np.arange(1,self.L_h+1)
-        self.d2 = np.square(self.d)
 
 
 
@@ -41,52 +89,33 @@ class EM:
         self.N_first = np.where(np.abs(h) > np.amax(np.abs(h))/2)[0][0] # First spike
 
 
-        # Initialize la
-        #c = 340
-        #fs = 16000
-        #la_i = 20*np.random.randn(1)+100
-        #self.la = 4*np.pi*(la_i[0])*c**3/fs**3         # Specific value
-        #self.la = la_u_true                            # True value
-        self.la = 3/(np.power(self.N_first,3))         # Estimated from N_first (Esp(N_first) = pow(3/la, 1/3))
-                                                                                 # well not really
+        # Initialize la: estimated from N_first (Esp(N_first) = pow(3/la,
+        # 1/3)).
+        self.la = 3/(np.power(self.N_first,3))
+
         print("la init = {}".format(self.la), file=self.logfile)
 
 
-        # Initialize a (decreasing exponential parameter)
-        #T60 = 0.360
-        #self.a = 3*np.log(10)/(T60*fs)                         # Specific value
+        # Initialize a (decreasing exponential parameter): estimated from the
+        # energy of h decreaing exponentially.
         X = np.ones((self.L_h-self.N_first,2))
         X[:,0] = np.arange(self.N_first, self.L_h)
         y = np.log(np.convolve(np.square(h), np.ones(50)/50)+1e-10)[self.N_first:self.L_h]
-        self.a = -np.linalg.lstsq(X, y, rcond=None)[0][0]/2    # Estimated from the energy of h decreasing exponentially
-        #self.a = a_true                                        # True value
+        self.a = -np.linalg.lstsq(X, y, rcond=None)[0][0]/2
 
         self.e = np.exp(self.a*np.arange(0,self.L_h))
         self.e2 = np.square(self.e)
 
 
-        # Initialize A
-        self.P = 20
+        # Initialize A, parameters of the AR filter g: estimated from spectrum
+        # of h.
+        self.P = P
 
-        #                                                 # Estimated from values between N_first and N_first + P + 1
-        #self.delta = np.zeros(self.P+1)
-        #self.delta[0] = 1
-        #test1 = np.exp(-self.a*np.arange(self.N_first,self.N_first+self.P+1))*1/np.arange(self.N_first,self.N_first+self.P+1)*self.delta
-        #test = lfilter([1], h[self.N_first:self.N_first+self.P+1], test1)
-        #plt.plot(lfilter([1], test, delta))
-        #plt.show()
-        #test_roots = np.roots(test)
-        #test_roots_norm = [r if np.abs(r) < 1 else 1/np.conj(r) for r in test_roots]
-        #poly = np.poly(test_roots_norm)
-        #self.alpha_g = -poly[1:]
-                                                         # Estimated from spectrum of h
         f, t, H = stft(h)
         H = np.abs(H)
         autocorr = np.fft.irfft(np.square(np.mean(H[:,:], axis=1)))
         T = toeplitz(autocorr[:self.P],autocorr[:self.P])
         self.alpha_g = np.dot(np.linalg.inv(T), autocorr[1:self.P+1])
-        self.alpha_g = 20*np.random.randn(self.P)        # Specific value
-        #self.alpha_g = -alpha_g_true[1:]                 # True value
 
         self.A = np.concatenate([[1], -self.alpha_g])
 
@@ -99,12 +128,8 @@ class EM:
         self.rev_A = self.A[::-1]
 
 
-
-        # Initialize sigma2
-        #self.sigma2 = 8*1e-9                                           # Specific value
-        self.sigma2 = np.mean(np.square(self.h[:self.N_first-self.P])) # Estimated from values before N_first
-        #self.sigma2 = sigma2_true                                      # True value
-
+        # Initialize sigma2: estimated from values before N_first
+        self.sigma2 = np.mean(np.square(self.h[:self.N_first-self.P]))
 
 
         ## Initializing latent variables
@@ -112,16 +137,17 @@ class EM:
         self.R = np.zeros((self.L_h,self.L_h))
         self.E()
 
-        self.FE = 0
+        self.LP = 0
 
-        self.FE_list = [self.free_energy()]
+        self.LP_list = [self.log_prob()]
         self.A_list = [self.A]
         self.a_list = [self.a]
         self.la_list = [self.la]
         self.sigma2_list = [self.sigma2]
 
 
-    def propagate_mu(self):
+    def _propagate_mu(self):
+        """ Propagates any changes made to mu. """
         self.w = self.h-self.mu
 
         self.mu_pad = np.pad(self.mu, (self.P, 0), 'constant')
@@ -132,7 +158,8 @@ class EM:
         self.pi = self.pie*self.e
         self.p = self.pi*self.d
 
-    def propagate_R(self):
+    def _propagate_R(self):
+        """ Propagates any changes made to R. """
         self.R_pad = np.pad(self.R, [(self.P, 0), (0, 0)], 'constant')
         M_R = np.lib.stride_tricks.as_strided(self.R_pad,
                                                shape=[self.L_h, self.L_h, self.P+1],
@@ -146,7 +173,8 @@ class EM:
 
         self.pie_var = np.dot(self.M_half_pie_var_pad, self.rev_A)
 
-    def propagate_A(self):
+    def _propagate_A(self):
+        """ Propagates any changes made to A. """
         A_roots = np.roots(self.A)
         A_roots_norm = [r if np.abs(r) < 1 else 1/np.conj(r) for r in A_roots]
         A_poly = np.poly(A_roots_norm)
@@ -171,7 +199,8 @@ class EM:
 
         self.pie_var = np.dot(self.M_half_pie_var_pad, self.rev_A)
 
-    def propagate_a(self):
+    def _propagate_a(self):
+        """ Propagates any changes made to a. """
         self.e = np.exp(self.a*np.arange(0,self.L_h))
         self.e2 = np.square(self.e)
         self.pi = self.pie*self.e
@@ -179,20 +208,22 @@ class EM:
 
 
     def copy(self, old):
+        """
+        Deeply copies the attributes from old, from the same class, to the
+        current object.
+        """
         self.h = old.h
         self.L_h = old.L_h
 
         self.d = np.arange(1,self.L_h+1)
-        self.d2 = np.square(self.d)
 
         self.it = old.it
-        self.N_first = old.N_first # First spike
+        self.N_first = old.N_first
         self.la = old.la
         self.a = old.a
         self.e = np.copy(old.e)
         self.e2 = old.e2
 
-        # Initialize A
         self.P = old.P
         self.alpha_g = np.copy(old.alpha_g)
         self.A = np.copy(old.A)
@@ -218,62 +249,39 @@ class EM:
 
         self.rev_A = np.copy(old.rev_A)
 
-        self.FE = old.FE
-        self.FE_list = old.FE_list
+        self.LP = old.LP
+        self.LP_list = old.LP_list
         self.la_list = old.la_list
         self.a_list = old.a_list
         self.sigma2_list = old.sigma2_list
         self.A_list = old.A_list
 
 
-    def free_energy_slow(self):
-        res = -self.L_h/2*np.log(2*np.pi*self.la)
-        res = res + self.L_h*(self.L_h-1)/2*self.a
-
-        TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        t0 = time.time()
-        res = res - 1/(2*self.la)*np.square(np.linalg.norm((self.e*np.dot(TA, self.mu))))
-        res = res - 1/(2*self.la)*np.sum(self.e2*np.diag(np.dot(np.dot(TA,self.R),TA.transpose())))
-        print(time.time() - t0, file=self.logfile)
-
-        res = res - self.L_h/2*np.log(2*np.pi*self.sigma2)
-        res = res - 1/(2*self.sigma2)*(np.square(np.linalg.norm(self.h-self.mu))+np.trace(self.R))
-
-        print("diff = {}".format(res - self.FE), file=self.logfile)
-        self.FE = res
-        return res
-
-    def free_energy(self):
+    def log_prob(self):
+        """
+        Computes and returns the a posteriori expectation of the log-probability.
+        """
         res = -self.L_h/2*np.log(2*np.pi*self.la)
         res = res + self.L_h*(self.L_h-1)/2*self.a
 
 
-        #TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        t0 = time.time()
         res = res - 1/(2*self.la)*np.square(np.linalg.norm(self.e*self.pie))
 
-
         res = res - 1/(2*self.la)*np.sum(self.e2*self.pie_var)
-
-        #print("time free_energy : {} s".format(time.time() - t0), file=self.logfile)
-
 
         res = res - self.L_h/2*np.log(2*np.pi*self.sigma2)
         res = res - 1/(2*self.sigma2)*(np.square(np.linalg.norm(self.w))+np.trace(self.R))
 
-        print("diff = {}".format(res - self.FE), file=self.logfile)
-        self.FE = res
+        print("Log-probability difference = {}".format(res - self.LP), file=self.logfile)
+        self.LP = res
         return res
 
 
     def E(self):
+        """ Compute the regular, slow version of the Expectation step. """
 
         print("", file=self.logfile)
         print("Updating R", file=self.logfile)
-
-
-        #TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        #self.R = self.la*self.sigma2*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
 
 
         TAE = toeplitz(self.A*self.e2[:self.P+1], np.zeros(self.P+1))
@@ -285,21 +293,19 @@ class EM:
         res = res*np.array([self.e2]).transpose()
         self.R = self.la*self.sigma2*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*res)
 
-        #print(self.free_energy(), file=self.logfile)
 
 
         print("", file=self.logfile)
         print("Updating mu", file=self.logfile)
         self.mu = np.dot(self.R, self.h)/self.sigma2
-        #self.R = np.linalg.inv(1/self.sigma2*np.eye(self.L_h) + 1/self.la*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
-
 
 
         # Propagate
-        self.propagate_mu()
-        self.propagate_R()
+        self._propagate_mu()
+        self._propagate_R()
 
     def E_Kalman(self):
+        """ Compute the Kalman filter-based version of the Expectation step. """
         print("E step", file=self.logfile)
         # Computes the estimated mu and R using an RTS smoother after a Kalman filtering
 
@@ -323,10 +329,8 @@ class EM:
         R_prio[0,0,0] = R_prio[0,0,0]+self.la/self.e2[0]
 
         # Update
-        residual = self.h[0] - mu_prio[0,0] #np.dot(C, mu_prio[:,0])
-        #residual_cov = np.dot(np.dot(C, R_prio[:,:,0]), C.transpose()) + self.sigma2
+        residual = self.h[0] - mu_prio[0,0]
         residual_cov = R_prio[0,0,0] + self.sigma2
-        #K = np.dot(R_prio[:,:,0],C.transpose())/residual_cov
         K = R_prio[:,0,0]/residual_cov
 
         mu_post[:,0] = mu_prio[:, 0] + K*residual
@@ -344,46 +348,22 @@ class EM:
 
 
 
-            #R_prio[:,:,u] = np.dot(np.dot(F, R_post[:,:,u-1]), F.transpose())
             R_prio[1:,:,u] = R_post[:-1,:,u-1]
             R_prio[0,:,u] = np.dot(self.alpha_g, R_post[:-1,:,u-1])
             R_prio[:,1:,u] = R_prio[:,:-1,u]
             R_prio[:,0,u] = np.dot(self.alpha_g, R_prio[:,1:,u].transpose())
 
             R_prio[0,0,u] = R_prio[0,0,u]+self.la/self.e2[u]
-            #R_prio[:,:,u] = R_prio[:,:,u] + self.la*np.exp(-2*self.a*np.arange(u,u-self.P,-1))
 
             # Update
             residual = self.h[u] - mu_prio[0,u]#np.dot(C, mu_prio[:,u])
             residual_cov = R_prio[0,0,u] + self.sigma2
-            #residual_cov = np.dot(np.dot(C, R_prio[:,:,u]), C.transpose()) + self.sigma2
             rescovvec[u] = residual_cov
-
-            #if (u < 22):
-                #print("u : {}".format(u))
-                #print("mu_prio : {}".format(mu_prio[:,u]))
-                #plt.imshow(R_prio[:,:,u])
-                #plt.colorbar()
-                #plt.show()
-            #print("res : {}".format(residual))
-            #print("res_cov : {}".format(residual_cov))
-            K = R_prio[:,0,u]/residual_cov
-            #K_mat = np.eye(self.P)
-            #K_mat[:,0] = K_mat[:,0] - K
-            #K = np.dot(R_prio[:,:,u],C.transpose())/residual_cov
 
             mu_post[:,u] = mu_prio[:, u] + K*residual
 
 
             R_post[:,:,u] = R_prio[:,:,u] - np.dot(K[:,np.newaxis], R_prio[0:1,:,u])
-            #R_post[:,:,u] = np.dot(K_mat,R_prio[:,:,u])
-            #R_post[:,:,u] = np.dot((np.eye(self.P) - np.dot(K, C)),R_prio[:,:,u])
-            #if (u < 22):
-                #print("mu_post : {}".format(mu_post[:,u]))
-                #plt.imshow(R_post[:,:,u])
-                #plt.colorbar()
-                #plt.show()
-                #print("")
 
 
 
@@ -396,131 +376,42 @@ class EM:
         R_smooth[:,:,-1] = R_post[:,:,-1]
         self.R[-self.P:,-1] = np.flip(R_smooth[:,0, -1])
         self.R[-1,-self.P:] = np.flip(R_smooth[0,:, -1])
-        #self.R[-self.P:, -self.P:] = np.flip(R_smooth[:,:, -1])
 
 
         for u in range(self.L_h-1, self.P-1, -1):
-            #print("u : {}".format(u))
             J = R_post[:,:-1,u-1]
             J = np.concatenate([np.dot(self.alpha_g, J.transpose())[:,np.newaxis],J], axis=1)
             J = np.dot(J, np.linalg.inv(R_prio[:,:,u]))
-            #J = np.dot(np.dot(R_post[:,:,u-1], F.transpose()), np.linalg.inv(R_prio[:,:,u]))
 
             mu_smooth[:,u-1] = mu_post[:,u-1] + np.dot(J,mu_smooth[:,u] - mu_prio[:,u])
             self.mu[u-1] = mu_smooth[0, u-1]
 
             R_smooth[:,:,u-1] = R_post[:,:,u-1] + np.dot(np.dot(J,R_smooth[:,:,u] - R_prio[:,:,u]),J.transpose())
-            #self.R[u-1:,u-1] = R_smooth[:min(self.P, self.L_h-u+1),0,u-1]
 
 
             if u > self.P:
-                #self.R[max(0, u-self.P):(u), max(0, u-self.P):(u)] = np.flip(R_smooth[self.P - min(self.P, u):,self.P - min(self.P, u):, u-1])
-
-
-                #self.R[u-self.P:u, u-self.P:u] = np.flip(R_smooth[:,:,u-1])
                 self.R[u-self.P:u, u-1] = np.flip(R_smooth[:,0,u-1])
                 self.R[u-1,u-self.P:u] = np.flip(R_smooth[0,:,u-1])
 
             if u == self.P:
                 self.R[u-self.P:u, u-self.P:u] = np.flip(R_smooth[:,:,u-1])
 
-            #self.R[u-1,u-1:] = R_smooth[:min(self.P, self.L_h-u+1),0,u-1]
-            #if u == 21:
-                #plt.imshow(np.flip(R_smooth[:,:,u-1]))
-                #plt.colorbar()
-                #plt.show()
 
 
         self.mu[:self.P] = np.flip(mu_smooth[:,self.P-1])
 
-        #plt.plot(self.mu)
-        #plt.show()
-
         self.P = self.P-1
 
-        #plt.imshow(self.R)
-        #plt.colorbar()
-        #plt.show()
-
         # Propagate
-        self.propagate_mu()
-        self.propagate_R()
+        self._propagate_mu()
+        self._propagate_R()
 
-    def E_slow(self):
-
-        print("", file=self.logfile)
-        print("Updating R", file=self.logfile)
-
-
-        TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        self.R = self.la*self.sigma2*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
-        print(self.free_energy(), file=self.logfile)
-
-
-
-        print("", file=self.logfile)
-        print("Updating mu", file=self.logfile)
-        self.mu = np.dot(self.R, self.h)/self.sigma2
-        #self.R = np.linalg.inv(1/self.sigma2*np.eye(self.L_h) + 1/self.la*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
-
-
-
-        # Propagate
-        self.propagate_mu()
-        self.propagate_R()
-
-    def E_real(self): # Update by maximizing Free_energy wrt R : not working
-
-        print("", file=self.logfile)
-        print("Updating R", file=self.logfile)
-        TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        self.R = self.la*self.la*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
-        self.R = self.R - self.la*self.la/2*np.linalg.inv(np.dot(algo.h[:,np.newaxis], algo.h[np.newaxis,:]))
-        print(self.free_energy_slow(), file=self.logfile)
-
-
-        print("", file=self.logfile)
-        print("Updating mu", file=self.logfile)
-        self.mu = np.dot(self.R, self.h)/self.sigma2
-        #self.R = np.linalg.inv(1/self.sigma2*np.eye(self.L_h) + 1/self.la*np.dot(np.dot(TA.transpose(),np.diag(self.e2)),TA))
-
-
-
-        # Propagate
-        self.propagate_mu()
-        self.propagate_R()
-
-
-    def M_g_slow(self):
-
-        print("", file=self.logfile)
-        print("Updating g (slow version)", file=self.logfile)
-        mat = np.zeros((self.P,self.P))
-        vec = np.zeros((self.P,))
-
-        R_mat = np.zeros((self.P,self.P))
-        R_vec = np.zeros((self.P,))
-
-        for p in range(self.P):
-            for u in range(p,self.L_h):
-                vec[p] = vec[p] + (self.mu[u]*self.mu[u-p-1] + self.R[u,u-p-1])*np.exp(2*self.a*u)
-                R_vec[p] = R_vec[p] + self.R[u,u-p-1]*np.exp(2*self.a*u)
-                for q in range(0, min(u , self.P)):
-                    R_mat[p,q] = R_mat[p,q] + self.R[u-q-1,u-p-1]*np.exp(2*self.a*u)
-                    mat[p,q] = mat[p,q] + (self.mu[u-q-1]*self.mu[u-p-1] + self.R[u-q-1,u-p-1])*np.exp(2*self.a*u)
-
-        self.alpha_g = np.linalg.solve(mat, vec)
-        self.A = np.concatenate([[1], -self.alpha_g])
-
-
-        self.propagate_A()
 
     def M_g(self):
+        """ Computes the maximization step for the parameter g. """
 
         print("", file=self.logfile)
         print("Updating g", file=self.logfile)
-        # (M_mu1*exp*M_mu1.T + M_R)*alpha = v_mu + v_R
-        #mu_pad = np.pad(self.mu, (self.P, 0), 'constant')
         M_mu1 = np.lib.stride_tricks.as_strided(self.mu_pad,
                                                shape=[self.P+1, self.L_h],
                                                strides=[self.mu_pad.strides[-1], self.mu_pad.strides[-1]])
@@ -544,29 +435,19 @@ class EM:
         self.alpha_g = np.dot(np.linalg.inv(M_mu + M_R), v_mu+v_R)
         self.A = np.concatenate([[1], -self.alpha_g])
 
-        self.propagate_A()
+        self._propagate_A()
 
     def M_la(self):
+        """ Computes the maximization step for the parameter lambda. """
 
         print("", file=self.logfile)
         print("Updating lambda", file=self.logfile)
-        #TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        #self.la = 1/self.L_h*(np.square(np.linalg.norm((self.e*np.dot(TA, self.mu)))) +\
-        #                      np.sum(self.e2*np.diag(np.dot(np.dot(TA,self.R),TA.transpose()))))
 
 
         self.la = 1/self.L_h*(np.square(np.linalg.norm((self.e*self.pie))))
         self.la = self.la + 1/self.L_h*(np.sum(self.e2*self.pie_var))
 
-    def M_la_slow(self):
-
-        print("", file=self.logfile)
-        print("Updating lambda", file=self.logfile)
-        TA = toeplitz(np.concatenate([self.A, np.zeros((self.L_h-self.P-1))]),np.zeros(self.L_h))
-        self.la = 1/self.L_h*(np.square(np.linalg.norm((self.e*np.dot(TA, self.mu)))) +\
-                              np.sum(self.e2*np.diag(np.dot(np.dot(TA,self.R),TA.transpose()))))
-
-    def F_a(self, x, la_dep=True, calc=True):
+    def _F_a(self, x, la_dep=True, calc=True):
         if calc:
             self.vec_F_a = np.square(self.pie) + self.pie_var
 
@@ -577,6 +458,8 @@ class EM:
             return self.L_h*(self.L_h-1)/2 - 1/self.la * np.sum(self.vec_F_a * np.arange(1,self.L_h+1) * np.exp(2*x*np.arange(self.L_h)))
 
     def M_a(self, la_dep=True):
+        """ Computes the maximization step for the parameter a. """
+
         print("Updating a", file=self.logfile)
         # Initialize vec_F_a
         self.vec_F_a = np.square(self.pie) + self.pie_var
@@ -584,53 +467,54 @@ class EM:
         min = 0
         max = self.a
 
-        while (self.F_a(max, la_dep=la_dep, calc=False) > 0):
+        while (self._F_a(max, la_dep=la_dep, calc=False) > 0):
             max = 2*max
 
         for it in range(40):
-            if self.F_a((min+max)/2, la_dep=la_dep, calc=False) > 0:
+            if self._F_a((min+max)/2, la_dep=la_dep, calc=False) > 0:
                 min = (min+max)/2
             else:
                 max = (min+max)/2
 
         self.a = (min+max)/2
 
-        self.propagate_a()
+        self._propagate_a()
 
     def M_sigma(self):
+        """ Computes the maximization step for the parameter sigma2. """
 
         print("", file=self.logfile)
         print("Updating sigma_2", file=self.logfile)
         self.sigma2 = 1/self.L_h*(np.square(np.linalg.norm(self.w)) + np.trace(self.R))
 
 
-    def iteration(self, E="kalman", la_dep=False):
-        #self.R = np.maximum(self.R, 0)
+    def iteration(self, E="kalman", la_dep=True):
+        """
+        Iterates over Expectation and Maximization steps once and stores the
+        parameters at each iteration.
+
+        Parameters
+        ----------
+        E : string, default="kalman"
+            Specifies which algorithm to use for the expectation step :
+            "kalman" or "slow". Default is "kalman".
+        la_dep : bool, default=True
+            Specify whether to consider a dependency of a on lambda in the
+            maximization with respect to a. Default is True.
+        """
         # M step
         test_roots = np.roots(self.A)
         print("max root before = {}".format(np.amax(np.abs(test_roots))), file=self.logfile)
 
-        t0 = time.time()
         self.M_g()
-        print("time M_g : {} s".format(time.time()-t0), file=self.logfile)
 
         print("A = {}".format(self.A), file=self.logfile)
         print("", file=self.logfile)
-        test_roots = np.roots(self.A)
-        print("max root = {}".format(np.amax(np.abs(test_roots))), file=self.logfile)
 
         self.A_list.append(self.A)
 
 
-
-
-
-        #print("fe before a : {}".format(self.free_energy()), file=self.logfile)
-        t0 = time.time()
         self.M_a(la_dep=la_dep)
-
-        print("time M_a : {} s".format(time.time()-t0), file=self.logfile)
-        #print("fe after a : {}".format(self.free_energy()), file=self.logfile)
 
         print("a = {}".format(self.a), file=self.logfile)
         print("", file=self.logfile)
@@ -638,41 +522,44 @@ class EM:
 
 
 
-        t0 = time.time()
         self.M_la()
-        print("time M_la : {} s".format(time.time()-t0), file=self.logfile)
 
-        #print("fe after la : {}".format(self.free_energy()))
 
         print("lambda = {}".format(self.la), file=self.logfile)
         print("", file=self.logfile)
         self.la_list.append(self.la)
 
-        #t0 = time.time()
         self.M_sigma()
-        #print("time M_sigma : {} s".format(time.time()-t0))
 
         print("sigma_2 = {}".format(self.sigma2), file=self.logfile)
         self.sigma2_list.append(self.sigma2)
 
 
         # E step
-        #t0 = time.time()
         if E == "slow":
             self.E()
         elif E == "kalman":
             self.E_Kalman()
         else:
             raise Exception('E should be slow or kalman')
-        print("time E : {} s".format(time.time()-t0), file=self.logfile)
 
-        # FE history
+        # LP history
         print("", file=self.logfile)
-        self.FE_list.append(self.free_energy())
-        print("last free energy : {}".format(self.FE_list[-1]), file=self.logfile)
+        self.LP_list.append(self.log_prob())
+        print("last free energy : {}".format(self.LP_list[-1]), file=self.logfile)
 
 
 def save_EM(algo, filename):
+    """
+    Smartly saves the object of class EM in a given file using pickle.
+
+    Parameters
+    ----------
+    algo : EM object
+        The object to save.
+    filename : string
+        The path of the file to which save.
+    """
     if isinstance(algo, list):
         del algo[0].R
         del algo[0].R_pad
@@ -694,6 +581,18 @@ def save_EM(algo, filename):
 
 
 def load_EM(filename, E=True):
+    """
+    Smartly loads the object of class EM in a given file using pickle.
+
+    Parameters
+    ----------
+    filename : string
+        The path of the file to load.
+    E : bool, default=True
+        Specifies whether to immediatly compute an E step to recompute the R
+        matrix. Disable to save time if you are only loading to look at the
+        results, not to keep updating.
+    """
     with open(filename, 'rb') as input:
         algo = pickle.load(input)
 
