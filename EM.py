@@ -13,6 +13,8 @@ else:
     import cPickle as pickle
 
 
+
+
 class EM:
     '''
     Class handling the EM algorithm latent variables, parameters and hyper-parameters.
@@ -73,6 +75,7 @@ class EM:
     '''
 
     def __init__(self, h, P=20, log=sys.stdout):
+        np.random.seed(0)
         self.logfile = log
         print("Initializing EM algorithm", file=self.logfile)
 
@@ -116,6 +119,7 @@ class EM:
         autocorr = np.fft.irfft(np.square(np.mean(H[:,:], axis=1)))
         T = toeplitz(autocorr[:self.P],autocorr[:self.P])
         self.alpha_g = np.dot(np.linalg.inv(T), autocorr[1:self.P+1])
+        self.alpha_g = 20*np.random.randn(self.P)
 
         self.A = np.concatenate([[1], -self.alpha_g])
 
@@ -360,6 +364,7 @@ class EM:
             residual_cov = R_prio[0,0,u] + self.sigma2
             rescovvec[u] = residual_cov
 
+            K = R_prio[:,0,u]/residual_cov
             mu_post[:,u] = mu_prio[:, u] + K*residual
 
 
@@ -503,9 +508,6 @@ class EM:
             maximization with respect to a. Default is True.
         """
         # M step
-        test_roots = np.roots(self.A)
-        print("max root before = {}".format(np.amax(np.abs(test_roots))), file=self.logfile)
-
         self.M_g()
 
         print("A = {}".format(self.A), file=self.logfile)
@@ -519,7 +521,6 @@ class EM:
         print("a = {}".format(self.a), file=self.logfile)
         print("", file=self.logfile)
         self.a_list.append(self.a)
-
 
 
         self.M_la()
