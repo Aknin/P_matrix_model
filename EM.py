@@ -119,7 +119,6 @@ class EM:
         autocorr = np.fft.irfft(np.square(np.mean(H[:,:], axis=1)))
         T = toeplitz(autocorr[:self.P],autocorr[:self.P])
         self.alpha_g = np.dot(np.linalg.inv(T), autocorr[1:self.P+1])
-        self.alpha_g = 20*np.random.randn(self.P)
 
         self.A = np.concatenate([[1], -self.alpha_g])
 
@@ -608,3 +607,5 @@ def load_EM(filename, E=True):
             algo.R = np.zeros((algo.L_h,algo.L_h))
             algo.E_Kalman()
     return algo
+
+
