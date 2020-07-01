@@ -11,7 +11,7 @@ Requirements
 
 How to use
 -------------
-  See notebook example.ipynb for an example run of the EM algorithm or help(EM) for documentation of the module.
+  See notebook **example.ipynb** for an example run of the EM algorithm or **help(EM)** for documentation of the module.
   
 Contact
 -------------
