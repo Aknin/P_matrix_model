@@ -5,7 +5,7 @@ Code estimating the parameters of a reverberation model with a fraquency depende
 
 Requirements
 -------------
-  - **python 3** version >= 3.8.5
+  - **python 3**
   - **numpy** version >= 1.16
   - **scipy** version >= 1.2.1
   - **wavio** version >= 0.0.4 (only for the notebook, available on pip)
