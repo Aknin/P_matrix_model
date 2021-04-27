@@ -1,18 +1,62 @@
 from __future__ import division, print_function
 import numpy as np
 
-from scipy.signal import lfilter, stft
-from scipy.linalg import toeplitz
-from scipy.signal import convolve2d, correlate2d
+from scipy.linalg import toeplitz, inv
+import scipy.signal as signal
+np.set_printoptions(suppress=True)
 import time
+from numpy.polynomial import polynomial as poly
 import sys
-
-if sys.version_info.major == 3:
-    import _pickle as pickle
-else:
-    import cPickle as pickle
+import pickle
 
 
+class P_class:
+    '''
+    Class handling the matrices P of coefficients P(i,j) = p^{\ast j}(i-j), where p is a filter.
+
+    Initialize with P_class(p).
+
+    Use P.matrix(T) to compute and return the full matrix of shape T x T and P.dot(x) to directly compute Px.
+    '''
+
+    def __init__(self, p):
+        self.p = (np.array(p))
+        self.L_p = self.p.shape[0]
+
+    def matrix(self, T, square=True):
+        N_rows = T if square else (T-1)*self.L_p+1
+        P = np.zeros((N_rows,T))
+
+        P[0,0] = 1
+        P[1:self.L_p+1,1] = self.p
+        p_power_i = self.p
+        for i in range(2,T):
+            p_power_i = np.convolve(p_power_i, self.p)
+            P[i:min(i+p_power_i.shape[0], N_rows),i] = p_power_i[:min(p_power_i.shape[0], N_rows-i)]
+        return P
+
+    def dot(self, x, test=True):
+        T = x.shape[0]
+        if test:
+            Pm = self.matrix(T)
+            return np.dot(Pm, x)
+        L = 1+(T-1)*self.L_p
+
+        Pk = np.fft.fft(self.p, L)
+        ek = np.exp(-2j*np.pi*np.arange(L)/L)
+        zk = Pk*ek
+
+        if x.ndim == 1:
+            Yk = poly.Polynomial(x)(zk)
+            res = np.real(np.fft.ifft(Yk))[:T]
+        else:
+            N_col = x.shape[1]
+            res = np.zeros((T, N_col))
+            for i in range(N_col):
+                Yk = poly.Polynomial(x[:,i])(zk)
+                res[:,i] = np.real(np.fft.ifft(Yk))[:T]
+
+        return res
 
 
 class EM:
@@ -31,8 +75,10 @@ class EM:
     ----------
     h : ndarray of shape (n_samples,)
         Real-valued time-series representation of the RIR.
-    P : int, default=20
-        Order of the auto-regressive filter g.
+    L_g : int, default=21
+        Order of the auto-regressive filter of coefficients g.
+    L_p : int, default=10
+        Order of the filter p.
     log : TextIOWrapper, default=sys.stdout
         File object used to print any log, default to standart output.
 
@@ -45,8 +91,10 @@ class EM:
         Real-valued time-series representation of the input RIR.
     it : int
         Number of past calls of the method iteration().
-    P : int
-        Order of the auto-regressive filter g.
+    L_g : int
+        Order of the auto-regressive filter of coefficients g.
+    L_p : int
+        Order of the filter p.
 
     mu : ndarray of shape (L_h,)
         Estimated mean of the latent variable b.
@@ -57,246 +105,194 @@ class EM:
         Estimated parameter lambda.
     a : float
         Estimated exponential decrease parameter a.
+    p : ndarray of shape (L_p,)
+        Estimated filter used to construct the matrix P.
     sigma2 : float
         Estimated white noise parameter sigma^2.
-    A : ndarray of shape (P,)
-        AR coefficients of the estimated filter g.
+    g : ndarray of shape (L_g,)
+        AR coefficients of the estimated filter G^{-1}.
 
     la_list : list of float
         List of past estimated parameter lambda.
     a_list : list of float
         List of past estimated exponential decrease parameter a.
+    p_list : list of ndarray of shape (L_p,)
+        List of past estimated filters used to construct the matrix P.
     sigma2_list : list of float
         List of past estimated white noise parameter sigma^2.
-    A_list : list of ndarray of shape (P,)
-        List of past AR coefficients of the estimated filter g.
+    g_list : list of ndarray of shape (L_g,)
+        List of past AR coefficients of the estimated filter G^{-1}.
     LP_list : list of float
         List of past log-probabilities computed by the method iteration().
     '''
-
-    def __init__(self, h, P=20, log=sys.stdout):
+    def __init__(self, h, L_g=20, L_p=10, log=sys.stdout, la=None, p=None, g=None, sigma2=None, a=None):
         np.random.seed(0)
         self.logfile = log
-        print("Initializing EM algorithm", file=self.logfile)
+        print("Initialization of the EM algorithm", file=self.logfile)
 
         ## Load hyper-parameters and observed variable
         self.h = np.array(h)
         self.L_h = len(h)
-        self.d = np.arange(1,self.L_h+1)
 
-
+        self.d = np.arange(1, self.L_h+1)
+        self.d2 = np.square(self.d)
 
 
         ## Initializing parameters
         self.it = 0
         self.N_first = np.where(np.abs(h) > np.amax(np.abs(h))/2)[0][0] # First spike
 
-
-        # Initialize la: estimated from N_first (Esp(N_first) = pow(3/la,
-        # 1/3)).
-        self.la = 3/(np.power(self.N_first,3))
+        # Initialize la
+        if la is None:
+            self.la = 3/(np.power(self.N_first,3))       # Estimated from N_first
+        elif la == "rand":
+            c = 340
+            fs = 16000
+            la_i = 20*np.random.randn(1)+100
+            self.la = 4*np.pi*(la_i[0])*c**3/fs**3
+        else:
+            self.la = la
 
         print("la init = {}".format(self.la), file=self.logfile)
 
 
-        # Initialize a (decreasing exponential parameter): estimated from the
-        # energy of h decreaing exponentially.
-        X = np.ones((self.L_h-self.N_first,2))
-        X[:,0] = np.arange(self.N_first, self.L_h)
-        y = np.log(np.convolve(np.square(h), np.ones(50)/50)+1e-10)[self.N_first:self.L_h]
-        self.a = -np.linalg.lstsq(X, y, rcond=None)[0][0]/2
+        # Initialize a (decreasing exponential parameter)
+        if a is None:
+            X = np.ones((self.L_h-self.N_first, 2))
+            X[:,0] = np.arange(self.N_first, self.L_h)
+            y = np.log(np.convolve(np.square(h), np.ones(50)/50)+1e-10)[self.N_first:self.L_h]
+            self.a = -np.linalg.lstsq(X, y, rcond=None)[0][0]/2  #Estimated from the energy of h decreasing exponentially
+        elif a == "rand":
+            self.a = np.abs(np.random.randn(5)*0.1)
+        else:
+            self.a = a
 
-        self.e = np.exp(self.a*np.arange(0,self.L_h))
+        self.e = np.exp(self.a*np.arange(self.L_h))
         self.e2 = np.square(self.e)
 
 
-        # Initialize A, parameters of the AR filter g: estimated from spectrum
-        # of h.
-        self.P = P
-
-        f, t, H = stft(h)
-        H = np.abs(H)
-        autocorr = np.fft.irfft(np.square(np.mean(H[:,:], axis=1)))
-        T = toeplitz(autocorr[:self.P],autocorr[:self.P])
-        self.alpha_g = np.dot(np.linalg.inv(T), autocorr[1:self.P+1])
-
-        self.A = np.concatenate([[1], -self.alpha_g])
-
-        A_roots = np.roots(self.A)
-        A_roots_norm = [r if np.abs(r) < 1 else 1/np.conj(r) for r in A_roots]
-        A_poly = np.poly(A_roots_norm)
-
-        self.alpha_g = -A_poly[1:]
-        self.A = np.concatenate([[1], -self.alpha_g])
-        self.rev_A = self.A[::-1]
+        if p is None:
+            self.p = np.concatenate([[1],np.zeros(self.L_p-1)])
+            self.P = P_class(self.p)
+        elif isinstance(p, np.ndarray):
+            self.L_p = p.shape[0]
+            self.p = np.copy(p)
+            self.P = P_class(self.p)
+        elif p == "rand":
+            self.p = np.concatenate([[1],np.zeros(self.L_p-1)])
+            self.p[1:] = self.p[1:] + np.random.randn(self.L_p-1)*0.01
+            self.P = P_class(self.p)
+        else:
+            self.L_p = p.shape[0]
+            self.p = np.copy(p)
+            self.P = P_class(self.p)
 
 
-        # Initialize sigma2: estimated from values before N_first
-        self.sigma2 = np.mean(np.square(self.h[:self.N_first-self.P]))
+        #Initialize G
+        if g is None:
+            #Estimated from spectrum of h
+            f, t, H = signal.stft(h)
+            H = np.abs(H)
+            autocorr = np.fft.irfft(np.square(np.mean(H[:,:], axis=1)))
+            T = toeplitz(autocorr[:self.L_g-1], autocorr[:self.L_g-1])
+            self.g_plus = -np.dot(np.linalg.inv(T), autocorr[1:self.L_g])
 
 
-        ## Initializing latent variables
+            self.g = np.concatenate([[1], self.g_plus])
+
+            g_roots = np.roots(self.g)
+            g_roots_norm = [r if np.abs(r)<1 else 1/np.conj(r) for r in g_roots]
+            g_poly = np.poly(g_roots_norm)
+
+            self.g_plus = g_poly[1:]
+            self.g = np.concatenate([[1], self.g_plus])
+            self.rev_g = self.g[::-1]
+
+        elif isinstance(g, np.ndarray):
+            self.L_g = g.shape[0]
+            self.g_plus = g[1:]
+            self.g = np.concatenate([[1], self.g_plus])
+            self.rev_g = self.g[::-1]
+        elif g == "rand":
+            self.g_plus = np.random.randn(20)*0.3
+            self.g = np.concatenate([[1], self.g_plus])
+            self.rev_g = self.g[::-1]
+            print(self.g)
+        else:
+            self.L_g = g.shape[0]
+            self.g_plus = g[1:]
+            self.g = np.concatenate([[1], self.g_plus])
+            self.rev_g = self.g[::-1]
+
+
+        # Initialize sigma2
+        if sigma2 is None:
+            self.sigma2 = np.mean(np.square(self.h[:self.N_first-self.L_g+1]))   #Estimated from values before N_first
+        elif sigma2 == "rand":
+            self.sigma2 = np.abs(np.random.randn())*1e-9
+            print(self.sigma2)
+        else:
+            self.sigma2 = sigma2
+
+
+
+        # Initialize latent variables
         self.mu = self.h
-        self.R = np.zeros((self.L_h,self.L_h))
+        self.R = np.zeros((self.L_h, self.L_h))
         self.E()
 
-        self.LP = 0
+        self.FE = 0
 
-        self.LP_list = [self.log_prob()]
-        self.A_list = [self.A]
+        self.FE_list = []
+        self.free_energy()
+        self.g_list = [self.g]
+        self.p_list = [self.p]
         self.a_list = [self.a]
         self.la_list = [self.la]
         self.sigma2_list = [self.sigma2]
 
-
-    def _propagate_mu(self):
-        """ Propagates any changes made to mu. """
+    def propagate_mu(self):
         self.w = self.h-self.mu
 
-        self.mu_pad = np.pad(self.mu, (self.P, 0), 'constant')
-        self.M_mu = np.lib.stride_tricks.as_strided(self.mu_pad,
-                                               shape=[self.L_h, self.P+1],
-                                               strides=[self.mu_pad.strides[-1], self.mu_pad.strides[-1]])
-        self.pie = np.dot(self.M_mu, self.rev_A)
-        self.pi = self.pie*self.e
-        self.p = self.pi*self.d
 
-    def _propagate_R(self):
-        """ Propagates any changes made to R. """
-        self.R_pad = np.pad(self.R, [(self.P, 0), (0, 0)], 'constant')
-        M_R = np.lib.stride_tricks.as_strided(self.R_pad,
-                                               shape=[self.L_h, self.L_h, self.P+1],
-                                               strides=[self.R_pad.strides[0], self.R_pad.strides[1], self.R_pad.strides[0]])
+    def propagate_g(self):
+        self.g = np.concatenate([[1], self.g_plus])
 
-        self.half_pie_var = np.dot(M_R, self.rev_A)
-        self.half_pie_var_pad = np.pad(self.half_pie_var, [(0, 0), (self.P, 0)], 'constant')
-        self.M_half_pie_var_pad = np.lib.stride_tricks.as_strided(self.half_pie_var_pad,
-                                               shape=[self.L_h, self.P+1],
-                                               strides=[self.half_pie_var_pad.strides[0]+self.half_pie_var_pad.strides[1], self.half_pie_var_pad.strides[1]])
-
-        self.pie_var = np.dot(self.M_half_pie_var_pad, self.rev_A)
-
-    def _propagate_A(self):
-        """ Propagates any changes made to A. """
-        A_roots = np.roots(self.A)
-        A_roots_norm = [r if np.abs(r) < 1 else 1/np.conj(r) for r in A_roots]
-        A_poly = np.poly(A_roots_norm)
-        self.alpha_g = -A_poly[1:]
-        self.A = np.concatenate([[1], -self.alpha_g])
-
-        self.rev_A = self.A[::-1]
-
-        self.pie = np.dot(self.M_mu, self.rev_A)
-        self.pi = self.pie*self.e
-        self.p = self.pi*self.d
+        self.rev_g = self.g[::-1]
 
 
-        M_R = np.lib.stride_tricks.as_strided(self.R_pad,
-                                       shape=[self.L_h, self.L_h, self.P+1],
-                                       strides=[self.R_pad.strides[0], self.R_pad.strides[1], self.R_pad.strides[0]])
-        self.half_pie_var = np.dot(M_R, self.rev_A)
-        self.half_pie_var_pad = np.pad(self.half_pie_var, [(0, 0), (self.P, 0)], 'constant')
-        self.M_half_pie_var_pad = np.lib.stride_tricks.as_strided(self.half_pie_var_pad,
-                                               shape=[self.L_h, self.P+1],
-                                               strides=[self.half_pie_var_pad.strides[0]+self.half_pie_var_pad.strides[1], self.half_pie_var_pad.strides[1]])
 
-        self.pie_var = np.dot(self.M_half_pie_var_pad, self.rev_A)
-
-    def _propagate_a(self):
-        """ Propagates any changes made to a. """
-        self.e = np.exp(self.a*np.arange(0,self.L_h))
-        self.e2 = np.square(self.e)
-        self.pi = self.pie*self.e
-        self.p = self.pi*self.d
-
-
-    def copy(self, old):
-        """
-        Deeply copies the attributes from old, from the same class, to the
-        current object.
-        """
-        self.h = old.h
-        self.L_h = old.L_h
-
-        self.d = np.arange(1,self.L_h+1)
-
-        self.it = old.it
-        self.N_first = old.N_first
-        self.la = old.la
-        self.a = old.a
-        self.e = np.copy(old.e)
-        self.e2 = old.e2
-
-        self.P = old.P
-        self.alpha_g = np.copy(old.alpha_g)
-        self.A = np.copy(old.A)
-        self.sigma2 = old.sigma2
-        self.mu = np.copy(old.mu)
-        self.R = np.copy(old.R)
-
-        self.b = np.copy(old.mu)
-        self.w = np.copy(old.w)
-        self.pie = np.copy(old.pie)
-        self.pi = np.copy(old.pi)
-        self.p = np.copy(old.p)
-
-        self.mu_pad = np.copy(old.mu_pad)
-        self.M_mu = np.copy(old.M_mu)
-        self.R_pad = np.copy(old.R_pad)
-        #self.M_R = np.copy(old.M_R)
-
-        self.half_pie_var = np.copy(old.half_pie_var)
-        self.half_pie_var_pad = np.copy(old.half_pie_var_pad)
-        self.M_half_pie_var_pad = np.copy(old.M_half_pie_var_pad)
-        self.pie_var = np.copy(old.pie_var)
-
-        self.rev_A = np.copy(old.rev_A)
-
-        self.LP = old.LP
-        self.LP_list = old.LP_list
-        self.la_list = old.la_list
-        self.a_list = old.a_list
-        self.sigma2_list = old.sigma2_list
-        self.A_list = old.A_list
-
-
-    def log_prob(self):
-        """
-        Computes and returns the a posteriori expectation of the log-probability.
-        """
+    def free_energy(self):
         res = -self.L_h/2*np.log(2*np.pi*self.la)
         res = res + self.L_h*(self.L_h-1)/2*self.a
 
+        G = toeplitz(np.concatenate([self.g, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+        t0 = time.time()
+        res = res - 1/(2*self.la)*np.square(np.linalg.norm((np.dot(G, self.P.dot(self.e*self.mu)))))
 
-        res = res - 1/(2*self.la)*np.square(np.linalg.norm(self.e*self.pie))
 
-        res = res - 1/(2*self.la)*np.sum(self.e2*self.pie_var)
+        res = res - 1/(2*self.la)*np.sum(np.diag(np.dot(np.dot(G,self.P.dot(self.P.dot(self.e*self.e[:,np.newaxis]*self.R).transpose()).transpose()),G.transpose())))
 
         res = res - self.L_h/2*np.log(2*np.pi*self.sigma2)
-        res = res - 1/(2*self.sigma2)*(np.square(np.linalg.norm(self.w))+np.trace(self.R))
+        res = res - 1/(2*self.sigma2)*(np.square(np.linalg.norm(self.h-self.mu))+np.trace(self.R))
 
-        print("Log-probability difference = {}".format(res - self.LP), file=self.logfile)
-        self.LP = res
+        print("diff = {} (should be positive after M step)".format(res - self.FE), file=self.logfile)
+        self.FE = res
+        self.FE_list.append(res)
         return res
 
-
     def E(self):
-        """ Compute the regular, slow version of the Expectation step. """
-
         print("", file=self.logfile)
         print("Updating R", file=self.logfile)
 
 
-        TAE = toeplitz(self.A*self.e2[:self.P+1], np.zeros(self.P+1))
-        TA = toeplitz(self.A, np.zeros(self.P+1))
-        M = np.dot(TAE.transpose(), TA)
-        res = toeplitz(np.concatenate([M[:,0], np.zeros((self.L_h-self.P-1))]),
-                       np.concatenate([M[0,:], np.zeros((self.L_h-self.P-1))]))
-        res[-self.P:, -self.P:] = M[1:,1:]
-        res = res*np.array([self.e2]).transpose()
-        self.R = self.la*self.sigma2*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*res)
+        G = toeplitz(np.concatenate([self.g, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+        GP = np.dot(G, self.P.matrix(self.L_h))
 
 
+        M = self.e*self.e[:,np.newaxis]*np.dot(GP.transpose(), GP)
+
+        self.R = self.la*self.sigma2*np.linalg.inv(self.la*np.eye(self.L_h) + self.sigma2*M)
 
         print("", file=self.logfile)
         print("Updating mu", file=self.logfile)
@@ -304,308 +300,272 @@ class EM:
 
 
         # Propagate
-        self._propagate_mu()
-        self._propagate_R()
-
-    def E_Kalman(self):
-        """ Compute the Kalman filter-based version of the Expectation step. """
-        print("E step", file=self.logfile)
-        # Computes the estimated mu and R using an RTS smoother after a Kalman filtering
-
-        self.P = self.P+1
-
-        self.R[:] = 0
-        self.mu[:] = 0
-
-        F = np.eye(self.P, k=-1)
-        F[0,:-1] = self.alpha_g
-        Q = np.eye(self.P, 1)
-        C = Q.transpose()
-
-        # 1 : Forward pass
-        mu_prio = np.zeros((self.P, self.L_h))
-        R_prio = np.zeros((self.P, self.P, self.L_h))
-        mu_post = np.zeros((self.P, self.L_h))
-        R_post = np.zeros((self.P, self.P, self.L_h))
-
-        # Init on u = 0
-        R_prio[0,0,0] = R_prio[0,0,0]+self.la/self.e2[0]
-
-        # Update
-        residual = self.h[0] - mu_prio[0,0]
-        residual_cov = R_prio[0,0,0] + self.sigma2
-        K = R_prio[:,0,0]/residual_cov
-
-        mu_post[:,0] = mu_prio[:, 0] + K*residual
-
-        K_mat = np.eye(self.P)
-        K_mat[:,0] = K_mat[:,0] - K
-        R_post[:,:,0] = np.dot(K_mat,R_prio[:,:,0])
-
-        rescovvec = np.zeros(self.L_h)
-
-        for u in range(1,self.L_h):
-            # Predict
-            mu_prio[1:,u] = mu_post[:-1,u-1]
-            mu_prio[0,u] = np.dot(self.alpha_g,mu_post[:-1,u-1])
-
-
-
-            R_prio[1:,:,u] = R_post[:-1,:,u-1]
-            R_prio[0,:,u] = np.dot(self.alpha_g, R_post[:-1,:,u-1])
-            R_prio[:,1:,u] = R_prio[:,:-1,u]
-            R_prio[:,0,u] = np.dot(self.alpha_g, R_prio[:,1:,u].transpose())
-
-            R_prio[0,0,u] = R_prio[0,0,u]+self.la/self.e2[u]
-
-            # Update
-            residual = self.h[u] - mu_prio[0,u]#np.dot(C, mu_prio[:,u])
-            residual_cov = R_prio[0,0,u] + self.sigma2
-            rescovvec[u] = residual_cov
-
-            K = R_prio[:,0,u]/residual_cov
-            mu_post[:,u] = mu_prio[:, u] + K*residual
-
-
-            R_post[:,:,u] = R_prio[:,:,u] - np.dot(K[:,np.newaxis], R_prio[0:1,:,u])
-
-
-
-        # 2 : Backward pass
-        mu_smooth = np.zeros((self.P, self.L_h))
-        mu_smooth[:, -1] = mu_post[:, -1]
-        self.mu[-1] = mu_smooth[0, -1]
-
-        R_smooth = np.zeros((self.P, self.P, self.L_h))
-        R_smooth[:,:,-1] = R_post[:,:,-1]
-        self.R[-self.P:,-1] = np.flip(R_smooth[:,0, -1])
-        self.R[-1,-self.P:] = np.flip(R_smooth[0,:, -1])
-
-
-        for u in range(self.L_h-1, self.P-1, -1):
-            J = R_post[:,:-1,u-1]
-            J = np.concatenate([np.dot(self.alpha_g, J.transpose())[:,np.newaxis],J], axis=1)
-            J = np.dot(J, np.linalg.inv(R_prio[:,:,u]))
-
-            mu_smooth[:,u-1] = mu_post[:,u-1] + np.dot(J,mu_smooth[:,u] - mu_prio[:,u])
-            self.mu[u-1] = mu_smooth[0, u-1]
-
-            R_smooth[:,:,u-1] = R_post[:,:,u-1] + np.dot(np.dot(J,R_smooth[:,:,u] - R_prio[:,:,u]),J.transpose())
-
-
-            if u > self.P:
-                self.R[u-self.P:u, u-1] = np.flip(R_smooth[:,0,u-1])
-                self.R[u-1,u-self.P:u] = np.flip(R_smooth[0,:,u-1])
-
-            if u == self.P:
-                self.R[u-self.P:u, u-self.P:u] = np.flip(R_smooth[:,:,u-1])
-
-
-
-        self.mu[:self.P] = np.flip(mu_smooth[:,self.P-1])
-
-        self.P = self.P-1
-
-        # Propagate
-        self._propagate_mu()
-        self._propagate_R()
-
+        self.propagate_mu()
 
     def M_g(self):
-        """ Computes the maximization step for the parameter g. """
-
         print("", file=self.logfile)
         print("Updating g", file=self.logfile)
-        M_mu1 = np.lib.stride_tricks.as_strided(self.mu_pad,
-                                               shape=[self.P+1, self.L_h],
-                                               strides=[self.mu_pad.strides[-1], self.mu_pad.strides[-1]])
+        mat = np.zeros((self.L_g-1,self.L_g-1))
+        vec = np.zeros((self.L_g-1,))
 
-        M_mu1 = M_mu1[::-1,:]
-        M_mu2 = np.transpose(M_mu1[1:,:])
-        M_mu1 = M_mu1*self.e2
 
-        M_mu = np.dot(M_mu1, M_mu2)
-        v_mu = M_mu[0,:]
-        M_mu = M_mu[1:,:]
+        R_tilda = self.R + np.dot(self.mu[:,np.newaxis], self.mu[np.newaxis,])
 
-        M_R = np.zeros((self.P,self.P+1))
-        for p in range(1,self.P+1):
-            for q in range(0,self.P+1):
-                M_R[p-1,q] = np.sum(np.diag(self.R, q-p)[:self.L_h-max(p,q)]*self.e2[max(p,q):self.L_h])
+        PEREP = self.P.dot(self.P.dot(self.e*self.e[:,np.newaxis]*R_tilda).transpose()).transpose()
 
-        v_R = M_R[:,0]
-        M_R = M_R[:,1:]
+        traces_plus = np.zeros(self.L_g)
+        traces_minus = np.zeros(self.L_g)
+        for i in range(self.L_g):
+            traces_plus[i] = np.trace(PEREP, offset=i)
+            if i>0:
+                traces_minus[i] = np.trace(PEREP, offset=-i)
+            else:
+                traces_minus[i] = traces_plus[i]
 
-        self.alpha_g = np.dot(np.linalg.inv(M_mu + M_R), v_mu+v_R)
-        self.A = np.concatenate([[1], -self.alpha_g])
+        mat = toeplitz(traces_plus, traces_minus)
+        vec_plus = mat[1:,0]
+        mat_plus = mat[1:,1:]
 
-        self._propagate_A()
+        cumsum_matrix = np.flip(PEREP[-self.L_g+1:,-self.L_g+1:]).transpose()
+        mat_plus = mat_plus - cumsum_matrix
+        for i in range(1,self.L_g):
+            mat_plus[i:,i:] = mat_plus[i:,i:] - cumsum_matrix[:-i,:-i]
+
+
+
+        self.g_plus = np.linalg.solve(mat_plus, -vec_plus)
+        self.g = np.concatenate([[1], self.g_plus])
+
+
+        self.propagate_g()
+
+        self.g_list.append(self.g)
 
     def M_la(self):
-        """ Computes the maximization step for the parameter lambda. """
-
         print("", file=self.logfile)
         print("Updating lambda", file=self.logfile)
 
+        R_tilda = self.R + np.dot(self.mu[:,np.newaxis], self.mu[np.newaxis,])
+        PEREP = self.P.dot(self.P.dot(self.e*self.e[:,np.newaxis]*R_tilda).transpose())
 
-        self.la = 1/self.L_h*(np.square(np.linalg.norm((self.e*self.pie))))
-        self.la = self.la + 1/self.L_h*(np.sum(self.e2*self.pie_var))
+        G = toeplitz(np.concatenate([self.g, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+        tr_GPRPG = np.sum(np.einsum('ij,ji->i', G, np.dot(PEREP, G.transpose())))
+        self.la = tr_GPRPG/self.L_h
 
-    def _F_a(self, x, la_dep=True, calc=True):
-        if calc:
-            self.vec_F_a = np.square(self.pie) + self.pie_var
+        self.la_list.append(self.la)
+
+    def M_sigma(self):
+        print("", file=self.logfile)
+        print("Updating sigma", file=self.logfile)
+
+        self.sigma2 = 1/self.L_h*(np.square(np.linalg.norm(self.w)) + np.trace(self.R))
+        self.sigma2_list.append(self.sigma2)
+
+    def M_P(self, p0=False, step = 1e-7):
+        print("", file=self.logfile)
+        print("Updating P", file=self.logfile)
+
+        G = toeplitz(np.concatenate([self.g, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+        P_m = self.P.matrix(self.L_h)
+        G2 = np.dot(inv(P_m), np.dot(G, P_m))
+
+        grad_p = np.zeros(self.L_p)
+        hessian_p = np.eye(self.L_p)
+
+        R_tilda = self.R + np.dot(self.mu[:,np.newaxis], self.mu[np.newaxis,])
+        GRG = np.dot(G2,np.dot(R_tilda, G2.transpose()))
+        D = np.diag(np.arange(self.L_h))
+        P2 = np.zeros((self.L_h, self.L_h))
+        P2[1:,1:] = P_m[:-1,:-1]
+
+        mat_grad = np.dot(P2, np.dot(D, np.dot(GRG,P_m.transpose())))
+
+        for i in range(self.L_p):
+            grad_p[i] = -1/self.la*np.trace(mat_grad, offset=i)
+
+        grad_p[0] = grad_p[0] + 1/2*self.L_h*(self.L_h-1)
 
 
-        if la_dep:
-            return np.sum(self.vec_F_a * ((self.L_h-1)/2 - np.arange(self.L_h)) * np.exp(2*x*np.arange(self.L_h)))
-        else:
-            return self.L_h*(self.L_h-1)/2 - 1/self.la * np.sum(self.vec_F_a * np.arange(1,self.L_h+1) * np.exp(2*x*np.arange(self.L_h)))
+        self.p[(1-p0):] = self.p[(1-p0):] + step*grad_p[(1-p0):]
+        self.P = P_class(self.p)
 
-    def M_a(self, la_dep=True):
-        """ Computes the maximization step for the parameter a. """
+        self.p_list.append(self.p)
 
+
+    def M_P_newton(self, p0=False, step=1):
+        print("", file=self.logfile)
+        print("Updating P with Newton's method", file=self.logfile)
+
+        G = toeplitz(np.concatenate([self.g, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+        P_m = self.P.matrix(self.L_h)
+        P_m_inv = inv(P_m)
+
+
+        G2 = np.dot(P_m_inv, np.dot(G, P_m))
+
+        grad_p = np.zeros(self.L_p)
+        hessian_p = np.eye(self.L_p)
+
+        R_tilda = self.R + np.dot(self.mu[:,np.newaxis], self.mu[np.newaxis,])
+        GEREG = np.dot(G2,np.dot(self.e*self.e[:,np.newaxis]*R_tilda, G2.transpose()))
+
+
+        d = np.arange(self.L_h)[:,np.newaxis]
+        P2 = np.zeros((self.L_h, self.L_h))
+        P2[1:,1:] = P_m[:-1,:-1]
+
+        GEREGP = np.dot(GEREG,P_m.transpose())
+
+        mat_grad = np.dot(P2, (d*GEREGP))
+
+        for i in range(self.L_p):
+            grad_p[i] = -1/self.la*np.trace(mat_grad, offset=i)
+
+        grad_p[0] = grad_p[0] + 1/2*self.L_h*(self.L_h-1)
+
+
+        P3 = np.zeros((self.L_h, self.L_h))
+        P3[1:,1:] = P2[:-1,:-1]
+
+        d2 = (np.arange(self.L_h)*np.arange(-1, self.L_h-1))[:,np.newaxis]
+
+
+        mat_hess_1 = np.dot(P3, (d2*GEREGP))
+        mat_hess_2 = np.dot(P2, (d*np.dot(GEREG,(d*P2.transpose()))))
+
+
+        for i in range(self.L_p):
+            for j in range(self.L_p):
+                hessian_p[i,j] = -1/self.la*np.trace(mat_hess_1, offset=i+j)
+                hessian_p[i,j] = hessian_p[i,j] -1/self.la*np.trace(mat_hess_2[:-max(i,j),:-max(i,j)], offset=i-j)
+
+
+
+        self.p[(1-p0):] = self.p[(1-p0):] - step*np.dot(inv(hessian_p[(1-p0):,(1-p0):]),grad_p[(1-p0):])
+        self.P = P_class(self.p)
+
+        self.p_list.append(self.p)
+
+
+
+    def F_a(self, x, vec):
+        #res = self.L_h*(self.L_h-1)/2 - 1/self.la * np.sum(vec * np.arange(self.L_h) * np.exp(2*x*np.arange(self.L_h)))
+        res = np.sum(vec * ((self.L_h-1)/2 - np.arange(self.L_h)) * np.exp(2*x*np.arange(self.L_h)))
+
+        return res
+
+    def M_a(self):
+        print("", file=self.logfile)
         print("Updating a", file=self.logfile)
-        # Initialize vec_F_a
-        self.vec_F_a = np.square(self.pie) + self.pie_var
+        p_tilda = self.p/self.e[:self.L_p]
+        P_tilda = P_class(p_tilda)
+        P_tilda_m = P_tilda.matrix(self.L_h)
+
+        g_tilda = self.g/self.e[:self.L_g]
+        G_tilda = toeplitz(np.concatenate([g_tilda, np.zeros((self.L_h-self.L_g))]),np.zeros(self.L_h))
+
+        R_tilda = self.R + np.dot(self.mu[:,np.newaxis], self.mu[np.newaxis,])
+
+        GP = np.dot(G_tilda, P_tilda_m)
+        GPRPG_diag = np.sum(GP*(np.dot(GP,R_tilda.transpose())), axis=1)
+
 
         min = 0
         max = self.a
 
-        while (self._F_a(max, la_dep=la_dep, calc=False) > 0):
+        while (self.F_a(max, GPRPG_diag) > 0):
+            min = max
             max = 2*max
 
         for it in range(40):
-            if self._F_a((min+max)/2, la_dep=la_dep, calc=False) > 0:
+            if self.F_a((min+max)/2, GPRPG_diag) > 0:
                 min = (min+max)/2
             else:
                 max = (min+max)/2
 
         self.a = (min+max)/2
+        self.e = np.exp(self.a*np.arange(self.L_h))
+        self.e2 = np.square(self.e)
 
-        self._propagate_a()
-
-    def M_sigma(self):
-        """ Computes the maximization step for the parameter sigma2. """
-
-        print("", file=self.logfile)
-        print("Updating sigma_2", file=self.logfile)
-        self.sigma2 = 1/self.L_h*(np.square(np.linalg.norm(self.w)) + np.trace(self.R))
-
-
-    def iteration(self, E="kalman", la_dep=True):
-        """
-        Iterates over Expectation and Maximization steps once and stores the
-        parameters at each iteration.
-
-        Parameters
-        ----------
-        E : string, default="kalman"
-            Specifies which algorithm to use for the expectation step :
-            "kalman" or "slow". Default is "kalman".
-        la_dep : bool, default=True
-            Specify whether to consider a dependency of a on lambda in the
-            maximization with respect to a. Default is True.
-        """
-        # M step
-        self.M_g()
-
-        print("A = {}".format(self.A), file=self.logfile)
-        print("", file=self.logfile)
-
-        self.A_list.append(self.A)
-
-
-        self.M_a(la_dep=la_dep)
-
-        print("a = {}".format(self.a), file=self.logfile)
-        print("", file=self.logfile)
         self.a_list.append(self.a)
 
 
-        self.M_la()
+    def iteration(self, compute_FE=True):
+        print("Iteration {}".format(self.it), file=self.logfile)
+        algo.M_g()
+        algo.M_sigma()
+        algo.M_a()
+        algo.M_la()
+        algo.M_P_newton(False,step=1)
+        algo.E()
+        print("", flush=True, file=self.logfile)
+
+        if compute_FE:
+            algo.free_energy()
+
+        self.it = self.it + 1
 
 
-        print("lambda = {}".format(self.la), file=self.logfile)
-        print("", file=self.logfile)
-        self.la_list.append(self.la)
 
-        self.M_sigma()
+def save_algo(filename, algo, fs=None, V_room_true=None):
+    '''
+    Function saving the attributes of a object of the class EM in a pickle file.
 
-        print("sigma_2 = {}".format(self.sigma2), file=self.logfile)
-        self.sigma2_list.append(self.sigma2)
-
-
-        # E step
-        if E == "slow":
-            self.E()
-        elif E == "kalman":
-            self.E_Kalman()
-        else:
-            raise Exception('E should be slow or kalman')
-
-        # LP history
-        print("", file=self.logfile)
-        self.LP_list.append(self.log_prob())
-        print("last free energy : {}".format(self.LP_list[-1]), file=self.logfile)
-
-
-def save_EM(algo, filename):
-    """
-    Smartly saves the object of class EM in a given file using pickle.
-
-    Parameters
-    ----------
-    algo : EM object
-        The object to save.
-    filename : string
-        The path of the file to which save.
-    """
-    if isinstance(algo, list):
-        del algo[0].R
-        del algo[0].R_pad
-        del algo[0].half_pie_var
-        del algo[0].half_pie_var_pad
-    elif isinstance(algo, dict):
-        del algo["algo"].R
-        del algo["algo"].R_pad
-        del algo["algo"].half_pie_var
-        del algo["algo"].half_pie_var_pad
-    else:
-        del algo.R
-        del algo.R_pad
-        del algo.half_pie_var
-        del algo.half_pie_var_pad
-
-    with open(filename, 'wb') as output:
-        pickle.dump(algo, output, pickle.HIGHEST_PROTOCOL)
-
-
-def load_EM(filename, E=True):
-    """
-    Smartly loads the object of class EM in a given file using pickle.
 
     Parameters
     ----------
     filename : string
-        The path of the file to load.
-    E : bool, default=True
-        Specifies whether to immediatly compute an E step to recompute the R
-        matrix. Disable to save time if you are only loading to look at the
-        results, not to keep updating.
-    """
-    with open(filename, 'rb') as input:
-        algo = pickle.load(input)
+        Path to the file to save to.
+    algo : object of class EM
+        Object of the class EM to save.
+    fs : int, default=None
+        Sampling frequency to save along the EM object.
+    V_room_true : float, default=None
+        Volume of the room to save along the EM object.
+    '''
 
-    if E:
-        if isinstance(algo, list):
-            algo[0].R = np.zeros((algo[0].L_h,algo[0].L_h))
-            algo[0].E_Kalman()
-        elif isinstance(algo, dict):
-            algo["algo"].R = np.zeros((algo["algo"].L_h,algo["algo"].L_h))
-            algo["algo"].E_Kalman()
-        else:
-            algo.R = np.zeros((algo.L_h,algo.L_h))
-            algo.E_Kalman()
-    return algo
+    dic = {}
+    dic["h"] = algo.h
+    dic["sigma2"] = algo.sigma2
+    dic["lambda"] = algo.la
+    dic["g"] = algo.g
+    dic["p"] = algo.p
+    dic["a"] = algo.a
+    dic["FE_list"] = algo.FE_list
+    dic["fs"] = fs
+    dic["V_room_true"] = V_room_true
+
+    file = open(filename, "wb")
+    pickle.dump(dic, file)
+    file.close()
 
 
+
+def load_algo(filename):
+    '''
+    Function loading an object of the class EM from a pickle file.
+
+    Parameters
+    ----------
+    filename : string
+        Path to the file to load from.
+
+
+    Returns
+    ----------
+    algo : object of class EM
+        Object of the class EM loaded from the file.
+    fs : int, default=None
+        Sampling frequency loaded along the EM object.
+    '''
+
+    file = open(filename, "rb")
+    dic = pickle.load(file)
+    file.close()
+
+    print("Last FE: {}".format(dic["FE_list"][-1]))
+
+    print("Room volume: {}".format(dic["V_room_true"]))
+
+
+    return EM(dic["h"], sigma2=dic["sigma2"], la=dic["lambda"], g=dic["g"], p=dic["p"], a=dic["a"]), dic["fs"]
