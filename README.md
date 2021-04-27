@@ -1,7 +1,7 @@
 P_matrix_model
 ===
 
-Code estimating the parameters of a reverberation model with a fraquency dependent exponential decay, as described in [Stochastic reverberation model with a frequency dependent attenuation"_, WASPAA 2021].
+Code estimating the parameters of a reverberation model with a fraquency dependent exponential decay, as described in [Stochastic reverberation model with a frequency dependent attenuation" , WASPAA 2021].
 
 Requirements
 -------------
