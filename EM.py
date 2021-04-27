@@ -141,6 +141,8 @@ class EM:
         ## Initializing parameters
         self.it = 0
         self.N_first = np.where(np.abs(h) > np.amax(np.abs(h))/2)[0][0] # First spike
+        self.L_p = L_p
+        self.L_g = L_g
 
         # Initialize la
         if la is None:
@@ -492,16 +494,16 @@ class EM:
 
     def iteration(self, compute_FE=True):
         print("Iteration {}".format(self.it), file=self.logfile)
-        algo.M_g()
-        algo.M_sigma()
-        algo.M_a()
-        algo.M_la()
-        algo.M_P_newton(False,step=1)
-        algo.E()
+        self.M_g()
+        self.M_sigma()
+        self.M_a()
+        self.M_la()
+        self.M_P_newton(False,step=1)
+        self.E()
         print("", flush=True, file=self.logfile)
 
         if compute_FE:
-            algo.free_energy()
+            self.free_energy()
 
         self.it = self.it + 1
 
