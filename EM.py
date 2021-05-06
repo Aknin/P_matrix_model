@@ -146,7 +146,7 @@ class EM:
 
         # Initialize la
         if la is None:
-            self.la = 3/(np.power(self.N_first,3))       # Estimated from N_first
+            self.la = 3/(np.power(max(self.N_first,1),3))       # Estimated from N_first
         elif la == "rand":
             c = 340
             fs = 16000
@@ -229,7 +229,7 @@ class EM:
 
         # Initialize sigma2
         if sigma2 is None:
-            self.sigma2 = np.mean(np.square(self.h[:self.N_first-self.L_g+1]))   #Estimated from values before N_first
+            self.sigma2 = np.mean(np.square(self.h[:max(self.N_first-self.L_g+1, int(self.L_g/2))]))   #Estimated from values before N_first
         elif sigma2 == "rand":
             self.sigma2 = np.abs(np.random.randn())*1e-9
             print(self.sigma2)
@@ -565,7 +565,7 @@ def load_algo(filename):
     dic = pickle.load(file)
     file.close()
 
-    print("Last FE: {}".format(dic["FE_list"][-1]))
+    print("Last log-probability evaluation: {}".format(dic["FE_list"][-1]))
 
     print("Room volume: {}".format(dic["V_room_true"]))
 
